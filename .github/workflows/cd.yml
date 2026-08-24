@@ -1,0 +1,133 @@
+# ===========================================================================
+#  CD Pipeline — Continuous Deployment to AWS EC2 via CodeDeploy
+# ===========================================================================
+#  Triggered only on pushes to main (not PRs).
+#  The entire job is SKIPPED when AWS secrets are not configured, so the
+#  pipeline works out-of-the-box for local/demo setups without AWS.
+#
+#  Flow:
+#    configure AWS creds → login ECR → build & push image → bundle deploy
+#    scripts → upload to S3 → trigger CodeDeploy → wait → health check
+# ===========================================================================
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+# Only one deployment at a time — prevent race conditions where two
+# deploys overlap and leave the EC2 instance in an inconsistent state.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false    # don't cancel a running deploy; queue instead
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-to-aws:
+    name: Deploy to AWS EC2 via CodeDeploy
+    runs-on: ubuntu-latest
+
+    # Skip the entire job when AWS credentials aren't set.
+    # This lets contributors fork & run CI without CD failures.
+    if: github.ref == 'refs/heads/main' && vars.AWS_ENABLED == 'true'
+
+    # Define environment — enables GitHub Environment protection rules
+    # (manual approvals, secret scoping) when you configure one in Settings.
+    environment: production
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Checkout
+      # ---------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2. Configure AWS credentials
+      #    Uses the official AWS action to set env vars for the CLI.
+      #    NOTE: For production, migrate to OIDC federation instead of
+      #    long-lived access keys.  OIDC lets GitHub assume a short-lived
+      #    IAM role — no static secrets to rotate or leak.
+      #    See: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+      # ---------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ---------------------------------------------------------------
+      # 3. Login to Amazon ECR (Elastic Container Registry)
+      # ---------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------------------------------------------------------------
+      # 4. Build, tag, and push Docker image to ECR
+      #    Tagged with commit SHA — every push produces a unique,
+      #    traceable image.  Never use `latest` in production.
+      # ---------------------------------------------------------------
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: devops-pipeline-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # ---------------------------------------------------------------
+      # 5. Bundle deployment scripts for CodeDeploy
+      #    CodeDeploy expects an appspec.yml + hook scripts packaged
+      #    together.  We tar them into a single archive.
+      # ---------------------------------------------------------------
+      - name: Package application for CodeDeploy
+        run: |
+          mkdir -p bundle
+          cp -r deployment/* bundle/
+          cd bundle && tar -czf ../app-release.tar.gz .
+
+      # ---------------------------------------------------------------
+      # 6. Upload the deployment bundle to S3
+      #    CodeDeploy will pull from this S3 location.
+      # ---------------------------------------------------------------
+      - name: Upload revision to S3
+        run: |
+          aws s3 cp app-release.tar.gz s3://${{ secrets.S3_BUCKET }}/app-release.tar.gz \
+            --region ${{ secrets.AWS_REGION }}
+
+      # ---------------------------------------------------------------
+      # 7. Trigger CodeDeploy deployment
+      #    `aws deploy wait` blocks until the deployment succeeds or
+      #    fails (up to the default 30-min timeout).
+      # ---------------------------------------------------------------
+      - name: Create CodeDeploy deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name devops-pipeline-app \
+            --deployment-group-name devops-pipeline-app-group \
+            --s3-location bucket=${{ secrets.S3_BUCKET }},bundleType=tgz,key=app-release.tar.gz \
+            --query 'deploymentId' --output text)
+
+          echo "::notice::Deployment created: $DEPLOYMENT_ID"
+
+          aws deploy wait deployment-successful \
+            --deployment-id "$DEPLOYMENT_ID" \
+            --region ${{ secrets.AWS_REGION }}
+
+      # ---------------------------------------------------------------
+      # 8. Post-deploy smoke test
+      #    Hit the health endpoint on the live EC2 instance to confirm
+      #    the app is actually responding.  `-sf` = silent + fail on
+      #    HTTP errors.  `--retry` handles brief DNS/startup delays.
+      # ---------------------------------------------------------------
+      - name: Verify deployment health
+        run: |
+          curl -sf --retry 3 --retry-delay 5 \
+            http://${{ secrets.EC2_PUBLIC_DNS }}:3000/health \
+            || (echo "::error::Health check failed on live endpoint" && exit 1)

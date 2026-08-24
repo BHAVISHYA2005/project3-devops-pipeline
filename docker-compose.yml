@@ -1,0 +1,43 @@
+# ===========================================================================
+#  Docker Compose — local development stack
+# ===========================================================================
+#  Usage:
+#    docker compose up -d        # start in background
+#    docker compose logs -f      # tail logs
+#    docker compose down         # stop & remove containers
+#
+#  NOTE: The top-level `version:` key is DEPRECATED in Compose V2 and
+#  will trigger warnings. It has been intentionally removed.
+#  See: https://docs.docker.com/compose/compose-file/04-version-and-name/
+# ===========================================================================
+
+services:
+  app:
+    build:
+      context: ./app
+      # Dockerfile path is relative to `context`
+      dockerfile: Dockerfile
+    image: devops-pipeline-app:latest
+    container_name: devops-pipeline-app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s    # give the app time to boot before first check
+      retries: 3
+    restart: unless-stopped
+
+    # Resource limits — prevent a single container from consuming all
+    # host resources (OOM-killer, CPU starvation).  Adjust for your machine.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"       # half a CPU core max
+          memory: 256M       # 256 MB RAM max
+        reservations:
+          memory: 128M       # guaranteed minimum

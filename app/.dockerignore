@@ -1,0 +1,41 @@
+# ===========================================================================
+#  .dockerignore — keep the Docker build context small & secure
+# ===========================================================================
+#  Without this file, `docker build` sends EVERYTHING in the directory
+#  to the Docker daemon — including node_modules, .git, coverage reports,
+#  and potentially .env files containing secrets.
+#
+#  A proper .dockerignore:
+#    1. Speeds up builds (smaller context = faster COPY)
+#    2. Prevents secrets from leaking into images
+#    3. Avoids invalidating layer cache with irrelevant file changes
+# ===========================================================================
+
+# Dependencies — we install fresh inside the container via `npm ci`
+node_modules
+npm-debug.log*
+
+# Test & coverage artifacts — not needed in production image
+test
+coverage
+jest.config.*
+
+# Environment & secrets — NEVER bake these into an image
+.env
+.env.*
+
+# Version control — adds ~30 MB+ for no reason
+.git
+.gitignore
+
+# Docker meta-files — including them is circular and pointless
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Documentation
+*.md
+
+# IDE / editor config
+.vscode
+.idea

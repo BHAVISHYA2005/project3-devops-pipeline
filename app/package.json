@@ -1,0 +1,17 @@
+{
+  "name": "devops-pipeline-app",
+  "version": "1.0.0",
+  "description": "Sample Node.js app used to demo a CI/CD pipeline deploying to AWS EC2 via CodeDeploy",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --coverage"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0",
+    "supertest": "^6.3.3"
+  }
+}

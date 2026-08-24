@@ -1,0 +1,48 @@
+# ===========================================================================
+#  CodeDeploy Application Specification (appspec.yml)
+# ===========================================================================
+#  This file tells AWS CodeDeploy:
+#    1. Which files to copy where on the EC2 instance
+#    2. Which scripts to run during each lifecycle phase
+#
+#  Lifecycle order:
+#    ApplicationStop → BeforeInstall → ApplicationStart → ValidateService
+#
+#  Each hook script runs as the `ubuntu` user with a 300s (5 min) timeout.
+#  If any hook fails, the deployment is rolled back.
+#
+#  Reference: https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-appspec-file.html
+# ===========================================================================
+
+version: 0.0
+os: linux
+
+# Copy deployment scripts to the EC2 instance
+files:
+  - source: scripts
+    destination: /home/ubuntu/deployment/scripts
+
+hooks:
+  # Phase 1: Stop the currently running version
+  ApplicationStop:
+    - location: scripts/stop.sh
+      timeout: 300
+      runas: ubuntu
+
+  # Phase 2: Pre-install setup (ensure Docker is present, prune old images)
+  BeforeInstall:
+    - location: scripts/install.sh
+      timeout: 300
+      runas: ubuntu
+
+  # Phase 3: Pull new image from ECR and start container
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 300
+      runas: ubuntu
+
+  # Phase 4: Verify the new version is healthy (final gate)
+  ValidateService:
+    - location: scripts/validate.sh
+      timeout: 300
+      runas: ubuntu
