@@ -1,149 +1,125 @@
-# DevOps Pipeline Project — Node.js App → AWS EC2 via CodeDeploy
+# DevOps Pipeline Project — Node.js → Docker → AWS EC2
 
-A complete CI/CD pipeline for a Node.js/Express application using **GitHub Actions**, **Docker**, and **AWS** (EC2 + CodeDeploy + ECR + S3). Infrastructure is defined with **Terraform** (IaC).
+A CI/CD reference project: a small Express app delivered by GitHub Actions to
+EC2 through Amazon ECR, S3 and CodeDeploy, with all infrastructure defined in
+Terraform.
 
-> **Runs fully locally right now** — no AWS account needed. The AWS deployment is triggered automatically once you add your credentials as GitHub Secrets.
+The app is intentionally trivial. The subject of the repo is the delivery
+pipeline around it.
 
 ---
 
 ## Architecture
 
 ```
-                GitHub Actions (CI/CD)
-   ┌──────────────────────────────────────────────┐
-   │  push to main                                │
-   │    │                                         │
-   │    ├─ CI:  npm ci → npm test → docker build  │
-   │    │        → Trivy vulnerability scan       │
-   │    │                                         │
-   │    └─ CD:  build image → push to ECR         │
-   │             → package app → upload to S3     │
-   │             → CodeDeploy deploy → health     │
-   └──────────────────────────────────────────────┘
-                        │
-                        ▼
-              ┌──────────────────┐
-              │  AWS EC2 (t3.micro) │  ← CodeDeploy agent pulls & runs
-              │  Docker container    │     the image from ECR
-              │  on port 3000        │
-              └──────────────────┘
+                    GitHub Actions (one workflow, two jobs)
+   push / PR  ──►  ┌──────────────────────────────────────────────┐
+                   │ build-test                                   │
+                   │   npm ci → npm test → docker build → Trivy   │
+                   │   on main: push the scanned image to ECR     │
+                   │   outputs: image digest                      │
+                   └───────────────────────┬──────────────────────┘
+                                           │ needs (main only)
+                   ┌───────────────────────▼──────────────────────┐
+                   │ deploy                                       │
+                   │   bundle hooks → S3 → CodeDeploy → verify    │
+                   └───────────────────────┬──────────────────────┘
+                                           │
+                                           ▼
+             ┌──────────────────────────────────────────────┐
+             │ EC2 t3.micro (Elastic IP)                    │
+             │   CodeDeploy agent pulls the bundle from S3  │
+             │   runs 4 hooks → docker pull by digest       │
+             │   container on :3000                         │
+             └──────────────────────────────────────────────┘
 ```
 
-## Project Structure
+The image that Trivy scans is the image that gets deployed: `build-test` pushes
+it once and `deploy` ships it by digest, so there is no second build.
 
-```
-PROJECT3/
-├── app/                        # Node.js/Express application
-│   ├── src/                    # App source code
-│   │   ├── app.js              # Express app (routes)
-│   │   └── server.js           # Entry point
-│   ├── test/                   # Jest unit tests (100% coverage)
-│   ├── Dockerfile              # Multi-stage build, non-root user
-│   └── package.json
-├── .github/workflows/
-│   ├── ci.yml                  # CI: install, test, build, scan
-│   └── cd.yml                  # CD: ECR push + CodeDeploy deploy
-├── deployment/
-│   ├── appspec.yml             # CodeDeploy lifecycle hooks
-│   └── scripts/                # stop/install/start/validate hooks
-├── infra/                      # Terraform (AWS resources)
-│   ├── main.tf                 # VPC, SG, EC2, IAM, S3, CodeDeploy, EIP
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── user-data.sh            # EC2 bootstrap (installs CodeDeploy agent)
-├── docker-compose.yml          # Run locally with a single command
-└── README.md
-```
+## API
 
-## Run Locally (No AWS Required)
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness. Used by Docker, CodeDeploy and the post-deploy check |
+| `GET /api/info` | App name, version (git SHA), environment, Node version |
+| `GET /api/greet?name=X` | Returns a greeting; defaults to `World` |
+
+Unknown routes return a JSON `404`.
+
+## Run locally
 
 ```bash
-# 1. Run tests (Jest, 100% coverage)
 cd app
 npm install
-npm test
+npm test                              # Jest, coverage thresholds enforced
 
-# 2. Run the app in Docker
-docker compose up -d
-
-# 3. Verify
-curl http://localhost:3000/health
-curl http://localhost:3000/api/info
-curl "http://localhost:3000/api/greet?name=DevOps"
-
-# 4. Stop
+docker compose up -d                  # http://localhost:3000
+curl localhost:3000/health
 docker compose down
 ```
 
-**API Endpoints**
+## Pipeline
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Health check (used by CodeDeploy `ValidateService`) |
-| `GET /api/info` | App name, version, environment |
-| `GET /api/greet?name=X` | Returns a greeting |
+`.github/workflows/pipeline.yml` runs on every push and pull request.
 
-## CI/CD Pipeline
+**`build-test`** — install, test, build the image, scan it with Trivy
+(HIGH/CRITICAL, `ignore-unfixed`). On a push to `main` it also pushes the image
+to ECR and exposes the digest as a job output.
 
-### Continuous Integration (`.github/workflows/ci.yml`)
-Runs on every push/PR to `main`:
-1. Checkout code
-2. Setup Node 20
-3. `npm ci` (clean, reproducible install)
-4. `npm test` (Jest unit tests)
-5. Build Docker image
-6. **Trivy** vulnerability scan (fails build on HIGH/CRITICAL)
+**`deploy`** — runs only when `AWS_ENABLED` is `true` and only on `main`.
+It writes the image reference into the deployment bundle, uploads it to S3,
+triggers CodeDeploy, waits for the result, then asserts that `/api/info` reports
+the commit SHA that was just built.
 
-### Continuous Deployment (`.github/workflows/cd.yml`)
-Runs on push to `main` **only when AWS secrets are configured** (auto-skips otherwise):
-1. Build & push image to **Amazon ECR**
-2. Package app + deployment scripts into a tarball
-3. Upload revision to **S3**
-4. Create **CodeDeploy** deployment (in-place on EC2)
-5. Wait for success + verify `/health` on the EC2 endpoint
+No AWS credentials are needed for a fork or a pull request: every AWS step is
+conditional and the `deploy` job is skipped.
 
-### CodeDeploy lifecycle (`.github/../deployment/appspec.yml`)
-`ApplicationStop → BeforeInstall → ApplicationStart → ValidateService`
+## Infrastructure
 
-## Terraform Infrastructure (`infra/`)
-
-Provisioned when you get AWS access:
+`infra/` provisions the whole stack:
 
 | Resource | Purpose |
-|----------|---------|
-| Security Group | HTTP (80), app (3000), SSH (22) |
-| IAM Role + Instance Profile | Lets EC2 talk to CodeDeploy |
-| EC2 instance (t3.micro) | Runs the CodeDeploy agent + container |
-| S3 bucket | Stores deployment revisions |
-| CodeDeploy App + Group | In-place deploy, EC2 tag filter |
-| Elastic IP | Stable public endpoint |
+|---|---|
+| ECR repository | Stores images, keeps the last 10, scans on push |
+| S3 bucket | Stores CodeDeploy revision bundles (private, versioned) |
+| EC2 instance | Runs the CodeDeploy agent and the container |
+| IAM instance profile | CodeDeploy + ECR pull permissions, no static keys |
+| IAM service role | Permissions for CodeDeploy itself |
+| Security group | HTTP, app port 3000, SSH |
+| CodeDeploy app + group | In-place deploy, targets by `Name` tag, auto-rollback |
+| Elastic IP | Stable endpoint for the health check |
 
-```bash
-cd infra
-terraform init
-terraform plan
-terraform apply -auto-approve   # replace suffix in variables.tf first
-```
+## First-time AWS setup
 
-> Note: `infra/user-data.sh` hardcodes the `ap-south-1` region for the CodeDeploy agent installer — update it if you use a different region.
+1. Create the Terraform state bucket (`devops-pipeline-tfstate`) once, by hand.
+2. `cd infra && terraform init && terraform apply`. Note the outputs.
+3. Add repository **secrets**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+   `AWS_REGION`, `S3_BUCKET`, `EC2_PUBLIC_DNS`.
+4. Add repository **variable** `AWS_ENABLED` = `true`.
+   Deployments are skipped while it is unset.
+5. Push to `main`.
 
-## Setting Up AWS (When You Get Access)
+Use a scoped IAM user for CI (ECR push, S3 put, CodeDeploy create) rather than
+root keys, and prefer OIDC federation over long-lived keys once you can.
 
-1. Run `terraform apply` to provision everything.
-2. Add GitHub repository **Secrets**:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-   - `AWS_REGION` (e.g. `ap-south-1`)
-   - `S3_BUCKET` (from Terraform output)
-   - `EC2_PUBLIC_DNS` (from Terraform output)
-3. Push to `main` — the CD workflow deploys automatically.
+## Deployment lifecycle on the instance
 
-> Use a scoped IAM user with least-privilege (ECR, S3, CodeDeploy permissions) rather than your root keys.
+| Hook | Script | What it does |
+|---|---|---|
+| `ApplicationStop` | `stop.sh` | `docker rm -f` the old container (no-op on first deploy) |
+| `BeforeInstall` | `install.sh` | Ensure Docker exists, prune images older than 7 days |
+| `ApplicationStart` | `start.sh` | ECR login, pull by digest, run with limits and log rotation |
+| `ValidateService` | `validate.sh` | Poll `/health`, dump container logs and fail on timeout |
 
-## Interview Talking Points
+Every hook is idempotent, because rollback re-runs them.
 
-- **CI/CD**: Automated test → build → scan → deploy pipeline on GitHub Actions.
-- **Security**: Multi-stage Docker build, non-root container user, Trivy image scanning, IAM least privilege.
-- **Infrastructure as Code**: Entire AWS stack via Terraform (reproducible, reviewable).
-- **Deployment strategy**: In-place CodeDeploy with health-check validation and zero-downtime container restarts.
-- **Observability**: `/health` endpoint wired into deployment validation; container healthchecks.
+## Known limits
+
+- **In-place deploys are not zero-downtime.** The old container is removed
+  before the new one starts. Blue/green behind an ALB is the fix.
+- Uses the **default VPC** and leaves SSH open by default — set
+  `allowed_ssh_cidr`, and move to a dedicated VPC for anything real.
+- Terraform state has **no locking** (no DynamoDB table); fine for one operator.
+- The app has no database or persistence — this is a pipeline demo, not a
+  service.
