@@ -1,18 +1,6 @@
-/**
- * Unit Tests — Express API Endpoints
- * -----------------------------------
- * Uses supertest to make HTTP requests against the Express app
- * WITHOUT starting a real server (no port binding needed).
- *
- * Run:  npm test
- */
-
 const request = require('supertest');
 const app = require('../src/app');
 
-// ---------------------------------------------------------------------------
-// Health endpoint
-// ---------------------------------------------------------------------------
 describe('GET /health', () => {
   test('returns 200 with status OK and uptime', async () => {
     const res = await request(app).get('/health');
@@ -23,9 +11,6 @@ describe('GET /health', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Info endpoint
-// ---------------------------------------------------------------------------
 describe('GET /api/info', () => {
   test('returns app metadata with all expected fields', async () => {
     const res = await request(app).get('/api/info');
@@ -37,9 +22,6 @@ describe('GET /api/info', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Greet endpoint
-// ---------------------------------------------------------------------------
 describe('GET /api/greet', () => {
   test('returns greeting with provided name', async () => {
     const res = await request(app).get('/api/greet?name=DevOps');
@@ -51,5 +33,28 @@ describe('GET /api/greet', () => {
     const res = await request(app).get('/api/greet');
     expect(res.statusCode).toBe(200);
     expect(res.body.message).toBe('Hello, World!');
+  });
+});
+
+describe('unknown routes', () => {
+  test('returns a JSON 404 instead of HTML', async () => {
+    const res = await request(app).get('/does-not-exist');
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({ error: 'Not found' });
+  });
+});
+
+describe('error handler', () => {
+  test('returns a JSON 500 and logs the error', () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+
+    app.errorHandler(new Error('boom'), {}, res, () => {});
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Internal server error' });
+    expect(spy).toHaveBeenCalled();
+
+    spy.mockRestore();
   });
 });
