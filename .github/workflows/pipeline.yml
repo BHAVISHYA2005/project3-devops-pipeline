@@ -1,0 +1,142 @@
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ECR_REPOSITORY: devops-pipeline-app
+  CODEDEPLOY_APPLICATION: devops-pipeline-app
+  CODEDEPLOY_GROUP: devops-pipeline-app-group
+
+jobs:
+  build-test:
+    name: Build, test and scan
+    runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.push.outputs.image_ref }}
+      ecr_registry: ${{ steps.push.outputs.ecr_registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Test
+        working-directory: app
+        run: npm test
+
+      - name: Build image
+        run: docker build -t "$ECR_REPOSITORY:${{ github.sha }}" ./app
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && vars.AWS_ENABLED == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        if: github.event_name == 'push' && vars.AWS_ENABLED == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Pushes the same image that was scanned above, and records its digest so
+      # the deploy job ships exactly these bytes.
+      - name: Push image to ECR
+        id: push
+        if: github.event_name == 'push' && vars.AWS_ENABLED == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker tag "$ECR_REPOSITORY:$TAG" "$IMAGE"
+          docker push "$IMAGE"
+          {
+            echo "ecr_registry=$REGISTRY"
+            echo "image_ref=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to EC2 via CodeDeploy
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Write deploy environment
+        env:
+          ECR_REGISTRY: ${{ needs.build-test.outputs.ecr_registry }}
+          IMAGE_REF: ${{ needs.build-test.outputs.image_ref }}
+          IMAGE_TAG: ${{ github.sha }}
+          REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          cat > deployment/scripts/.env <<EOF
+          ECR_REGISTRY=$ECR_REGISTRY
+          IMAGE_REF=$IMAGE_REF
+          IMAGE_TAG=$IMAGE_TAG
+          AWS_REGION=$REGION
+          EOF
+
+      - name: Package bundle
+        run: |
+          mkdir -p bundle
+          cp -r deployment/. bundle/
+          tar -czf app-release.tar.gz -C bundle .
+
+      - name: Upload revision to S3
+        run: aws s3 cp app-release.tar.gz "s3://${{ secrets.S3_BUCKET }}/app-release.tar.gz"
+
+      - name: Create CodeDeploy deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "$CODEDEPLOY_APPLICATION" \
+            --deployment-group-name "$CODEDEPLOY_GROUP" \
+            --s3-location bucket=${{ secrets.S3_BUCKET }},bundleType=tgz,key=app-release.tar.gz \
+            --query 'deploymentId' --output text)
+          echo "::notice::Deployment $DEPLOYMENT_ID"
+          aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID"
+
+      # Asserts the running container reports this commit, not just "200 OK".
+      - name: Verify live version
+        run: |
+          BASE="http://${{ secrets.EC2_PUBLIC_DNS }}:3000"
+          curl -sf --retry 3 --retry-delay 5 "$BASE/health"
+          VERSION=$(curl -sf "$BASE/api/info" | jq -r .version)
+          echo "Live version: $VERSION"
+          test "$VERSION" = "${{ github.sha }}"
