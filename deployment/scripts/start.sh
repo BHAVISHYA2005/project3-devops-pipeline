@@ -1,54 +1,48 @@
 #!/bin/bash
-# ===========================================================================
-#  CodeDeploy Hook: ApplicationStart
-# ===========================================================================
-#  Purpose:  Pull the new Docker image from ECR and start the container.
-#
-#  Environment variables ECR_REGISTRY and IMAGE_TAG are expected to be set
-#  on the EC2 instance (e.g., via the CodeDeploy bundle or instance env).
-#  Defaults are provided for local testing.
-# ===========================================================================
-
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-ECR_REGISTRY="${ECR_REGISTRY:-public.ecr.aws}"
-ECR_REPOSITORY="devops-pipeline-app"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+cd "$(dirname "$0")"
+set -a
+. ./.env
+set +a
+
+# Fail loudly rather than pulling from some default registry.
+: "${ECR_REGISTRY:?ECR_REGISTRY missing from .env}"
+: "${IMAGE_REF:?IMAGE_REF missing from .env}"
+: "${IMAGE_TAG:?IMAGE_TAG missing from .env}"
+: "${AWS_REGION:?AWS_REGION missing from .env}"
+
 CONTAINER_NAME="devops-pipeline-app"
 HOST_PORT=3000
 CONTAINER_PORT=3000
-FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-# ---------------------------------------------------------------------------
-# Pull the new image
-# ---------------------------------------------------------------------------
-echo "[start] Pulling image: ${FULL_IMAGE}"
-docker pull "${FULL_IMAGE}"
+echo "[start] Logging in to ECR"
+aws ecr get-login-password --region "${AWS_REGION}" \
+  | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
-# ---------------------------------------------------------------------------
-# Start the container
-# ---------------------------------------------------------------------------
-echo "[start] Starting container '${CONTAINER_NAME}' on port ${HOST_PORT}"
+echo "[start] Pulling ${IMAGE_REF}"
+docker pull "${IMAGE_REF}"
+
+echo "[start] Starting container"
 docker run -d \
   --name "${CONTAINER_NAME}" \
   -p "${HOST_PORT}:${CONTAINER_PORT}" \
   --restart unless-stopped \
+  --stop-timeout 20 \
   --memory 256m \
   --cpus 0.5 \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
   -e NODE_ENV=production \
   -e PORT="${CONTAINER_PORT}" \
-  "${FULL_IMAGE}"
+  -e APP_VERSION="${IMAGE_TAG}" \
+  "${IMAGE_REF}"
 
-#  Flags explained:
-#    -d                    → run in background (detached)
-#    --restart unless-stopped → auto-restart on crash, but not after `docker stop`
-#    --memory / --cpus     → resource limits prevent runaway processes
-#    -e                    → inject environment variables
+# --stop-timeout 20: server.js needs up to 10s to drain, and the default
+# docker stop timeout is also 10s, so the two would race.
+# --log-opt: default json-file logging grows unbounded and fills the disk.
 
-echo "[start] Container started.  Waiting 5s for boot..."
+echo "[start] Waiting for boot"
 sleep 5
 
 echo "[start] Done."
